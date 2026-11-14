@@ -1,0 +1,151 @@
+name: Repair final-sss repository layout
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair-layout:
+    name: Restore folders and verify every file
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: true
+
+      - name: Restore the exact paths from SHA256SUMS.txt
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import re
+          import shutil
+          import sys
+
+          manifest = Path("SHA256SUMS.txt")
+          if not manifest.is_file():
+              sys.exit("ERROR: SHA256SUMS.txt topilmadi. Hech narsa o'zgartirilmadi.")
+
+          rows = []
+          for number, raw in enumerate(manifest.read_text(encoding="utf-8").splitlines(), 1):
+              if not raw.strip():
+                  continue
+              match = re.fullmatch(r"([0-9a-fA-F]{64})  (.+)", raw)
+              if not match:
+                  sys.exit(f"ERROR: SHA256SUMS.txt:{number} formati noto'g'ri.")
+              expected_hash, relative = match.groups()
+              target = Path(relative)
+              if target.is_absolute() or ".." in target.parts:
+                  sys.exit(f"ERROR: Xavfsiz bo'lmagan yo'l: {relative}")
+              rows.append((expected_hash.lower(), target))
+
+          if not rows:
+              sys.exit("ERROR: Manifest bo'sh.")
+
+          def digest(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          groups = {}
+          for expected_hash, target in rows:
+              groups.setdefault(target.name, []).append((expected_hash, target))
+
+          # Duplicated basenames in this manifest are intentional copies; their hashes must agree.
+          for basename, entries in groups.items():
+              hashes = {item[0] for item in entries}
+              if len(hashes) != 1:
+                  sys.exit(f"ERROR: {basename} uchun manifestda turli SHA-256 qiymatlar bor.")
+
+          # Build every required destination. Never overwrite a file with a wrong hash.
+          for expected_hash, target in rows:
+              if target.exists():
+                  if not target.is_file() or digest(target) != expected_hash:
+                      sys.exit(f"ERROR: {target} allaqachon bor, lekin checksum mos emas. Xavfsizlik uchun to'xtatildi.")
+                  continue
+
+              candidates = []
+              root_copy = Path(target.name)
+              if root_copy.is_file():
+                  candidates.append(root_copy)
+              for _, sibling_target in groups[target.name]:
+                  if sibling_target.is_file() and sibling_target not in candidates:
+                      candidates.append(sibling_target)
+
+              source = next((p for p in candidates if digest(p) == expected_hash), None)
+              if source is None:
+                  sys.exit(f"ERROR: {target} uchun mos asl fayl topilmadi. Xavfsizlik uchun to'xtatildi.")
+
+              target.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(source, target)
+              if digest(target) != expected_hash:
+                  sys.exit(f"ERROR: Nusxa checksum tekshiruvidan o'tmadi: {target}")
+              print(f"RESTORED: {source} -> {target}")
+
+          # Verify all manifest destinations before removing any flattened root duplicates.
+          for expected_hash, target in rows:
+              if not target.is_file() or digest(target) != expected_hash:
+                  sys.exit(f"ERROR: Yakuniy tekshiruvda xato: {target}")
+
+          # Remove a misplaced root-level copy only when the manifest proves its checksum
+          # and all intended destination copies are already present and verified.
+          removed = 0
+          for basename, entries in groups.items():
+              root_copy = Path(basename)
+              intended_paths = {target for _, target in entries}
+              expected_hash = entries[0][0]
+              if root_copy.is_file() and root_copy not in intended_paths and digest(root_copy) == expected_hash:
+                  if all(target.is_file() and digest(target) == expected_hash for _, target in entries):
+                      root_copy.unlink()
+                      removed += 1
+                      print(f"REMOVED misplaced root copy: {root_copy}")
+
+          # Production-critical checks.
+          required = [
+              "index.html",
+              "manifest.webmanifest",
+              "sw.js",
+              "assets/css/app-core.css",
+              "assets/js/core/contract.js",
+              "assets/js/core/module-registry.js",
+              "assets/js/core/boot.js",
+              "data/app-data.json",
+              "data/vocabulary-index.json",
+              "icons/icon-192.png",
+              "icons/icon-512.png",
+          ]
+          missing = [name for name in required if not Path(name).is_file()]
+          if missing:
+              sys.exit("ERROR: Muhim fayllar yo'q: " + ", ".join(missing))
+
+          audio = sorted(Path("audio").glob("listening-day-*.mp3"))
+          expected_audio = {f"listening-day-{i:02d}.mp3" for i in range(1, 85)}
+          actual_audio = {p.name for p in audio}
+          if actual_audio != expected_audio:
+              sys.exit(f"ERROR: MP3 tekshiruvi xato: {len(actual_audio)}/84 ta topildi.")
+
+          print(f"SUCCESS: {len(rows)} manifest yozuvi tekshirildi; {len(groups)} noyob fayl nomi.")
+          print(f"SUCCESS: {len(audio)}/84 MP3, asosiy papkalar va checksumlar to'g'ri.")
+          print(f"INFO: Noto'g'ri root nusxalari olib tashlandi: {removed}")
+          PY
+
+      - name: Commit the repaired layout to main
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No layout changes were needed; repository is already in the expected layout."
+          else
+            git diff --cached --stat
+            git commit -m "Repair repository directory layout"
+            git push origin HEAD:main
+          fi
